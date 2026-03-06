@@ -6,10 +6,10 @@ import android.speech.tts.UtteranceProgressListener;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
-import android.media.MediaMuxer;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.nio.ByteBuffer;
 import java.util.Locale;
 
@@ -47,11 +47,31 @@ void onUnLoad() {
     }
 }
 
-boolean convertWavToM4a(String wavPath, String m4aPath) {
+int getFreqIndex(int sampleRate) {
+    int[] rates = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350};
+    for (int i = 0; i < rates.length; i++) {
+        if (rates[i] == sampleRate) return i;
+    }
+    return 8; // default: 16000 Hz
+}
+
+byte[] createAdtsHeader(int profile, int freqIndex, int channels, int aacFrameLength) {
+    int frameLength = aacFrameLength + 7;
+    byte[] header = new byte[7];
+    header[0] = (byte) 0xFF;
+    header[1] = (byte) 0xF1;
+    header[2] = (byte) (((profile - 1) << 6) | (freqIndex << 2) | (channels >> 2));
+    header[3] = (byte) (((channels & 3) << 6) | (frameLength >> 11));
+    header[4] = (byte) ((frameLength >> 3) & 0xFF);
+    header[5] = (byte) (((frameLength & 7) << 5) | 0x1F);
+    header[6] = (byte) 0xFC;
+    return header;
+}
+
+boolean convertWavToAac(String wavPath, String aacPath) {
     FileInputStream fis = null;
+    FileOutputStream fos = null;
     MediaCodec codec = null;
-    MediaMuxer muxer = null;
-    boolean muxerStarted = false;
     try {
         fis = new FileInputStream(wavPath);
         byte[] riffHeader = new byte[12];
@@ -87,6 +107,9 @@ boolean convertWavToM4a(String wavPath, String m4aPath) {
 
         log("SystemTTS: WAV format - channels=" + channels + ", sampleRate=" + sampleRate + ", bitsPerSample=" + bitsPerSample);
 
+        int freqIndex = getFreqIndex(sampleRate);
+        int profile = 2; // AAC-LC
+
         MediaFormat format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, channels);
         format.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
         format.setInteger(MediaFormat.KEY_BIT_RATE, 64000);
@@ -96,8 +119,7 @@ boolean convertWavToM4a(String wavPath, String m4aPath) {
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
         codec.start();
 
-        muxer = new MediaMuxer(m4aPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
-        int trackIndex = -1;
+        fos = new FileOutputStream(aacPath);
 
         byte[] readBuffer = new byte[8192];
         boolean inputDone = false;
@@ -126,17 +148,15 @@ boolean convertWavToM4a(String wavPath, String m4aPath) {
 
             MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
             int outputIndex = codec.dequeueOutputBuffer(bufferInfo, 10000);
-            if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                if (!muxerStarted) {
-                    trackIndex = muxer.addTrack(codec.getOutputFormat());
-                    muxer.start();
-                    muxerStarted = true;
-                }
-            } else if (outputIndex >= 0) {
-                ByteBuffer outputBuf = codec.getOutputBuffer(outputIndex);
-                if (muxerStarted && bufferInfo.size > 0 &&
-                    (bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
-                    muxer.writeSampleData(trackIndex, outputBuf, bufferInfo);
+            if (outputIndex >= 0) {
+                if (bufferInfo.size > 0 && (bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
+                    ByteBuffer outputBuf = codec.getOutputBuffer(outputIndex);
+                    outputBuf.position(bufferInfo.offset);
+                    byte[] aacData = new byte[bufferInfo.size];
+                    outputBuf.get(aacData);
+                    byte[] adtsHeader = createAdtsHeader(profile, freqIndex, channels, aacData.length);
+                    fos.write(adtsHeader);
+                    fos.write(aacData);
                 }
                 codec.releaseOutputBuffer(outputIndex, false);
                 if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
@@ -145,15 +165,14 @@ boolean convertWavToM4a(String wavPath, String m4aPath) {
             }
         }
 
-        log("SystemTTS: WAV to M4A conversion completed");
+        log("SystemTTS: WAV to AAC conversion completed");
         return true;
     } catch (Exception e) {
-        log("SystemTTS: WAV to M4A conversion failed: " + e.getMessage());
+        log("SystemTTS: WAV to AAC conversion failed: " + e.getMessage());
         return false;
     } finally {
         try { if (codec != null) { codec.stop(); codec.release(); } } catch (Exception e) {}
-        try { if (muxer != null && muxerStarted) { muxer.stop(); } } catch (Exception e) {}
-        try { if (muxer != null) { muxer.release(); } } catch (Exception e) {}
+        try { if (fos != null) fos.close(); } catch (Exception e) {}
         try { if (fis != null) fis.close(); } catch (Exception e) {}
     }
 }
@@ -176,12 +195,12 @@ boolean onClickSendBtn(String text) {
         log("SystemTTS: target talker=" + talker);
         long ts = System.currentTimeMillis();
         String wavPath = cacheDir + "/tts_" + ts + ".wav";
-        String m4aPath = cacheDir + "/tts_" + ts + ".m4a";
+        String aacPath = cacheDir + "/tts_" + ts + ".aac";
         String silkPath = cacheDir + "/tts_" + ts + ".silk";
         String utteranceId = "tts_" + ts;
         File wavFile = new File(wavPath);
-        File m4aFile = new File(m4aPath);
-        log("SystemTTS: wavPath=" + wavPath + ", m4aPath=" + m4aPath + ", silkPath=" + silkPath);
+        File aacFile = new File(aacPath);
+        log("SystemTTS: wavPath=" + wavPath + ", aacPath=" + aacPath + ", silkPath=" + silkPath);
 
         tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
             public void onStart(String utteranceId) {
@@ -196,9 +215,9 @@ boolean onClickSendBtn(String text) {
                 File silkFile = new File(silkPath);
 
                 try {
-                    if (convertWavToM4a(wavPath, m4aPath)) {
-                        log("SystemTTS: M4A file size=" + m4aFile.length());
-                        mp3ToSilk(m4aPath, silkPath);
+                    if (convertWavToAac(wavPath, aacPath)) {
+                        log("SystemTTS: AAC file size=" + aacFile.length());
+                        mp3ToSilk(aacPath, silkPath);
                         log("SystemTTS: silk file size=" + silkFile.length());
                         if (silkFile.exists() && silkFile.length() > 0 && silkFile.length() < MAX_SILK_SIZE) {
                             conversionOk = true;
@@ -221,7 +240,7 @@ boolean onClickSendBtn(String text) {
                         toast("语音转换失败");
                     }
                     wavFile.delete();
-                    m4aFile.delete();
+                    aacFile.delete();
                     new File(silkPath).delete();
                     log("SystemTTS: temporary files cleaned up");
                 });
@@ -230,7 +249,7 @@ boolean onClickSendBtn(String text) {
             public void onError(String utteranceId) {
                 log("SystemTTS: synthesis error, utteranceId=" + utteranceId);
                 wavFile.delete();
-                m4aFile.delete();
+                aacFile.delete();
                 toast("语音合成失败");
             }
         });
